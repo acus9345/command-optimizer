@@ -1,0 +1,16 @@
+{
+  "name": "command-optimizer-marketplace",
+  "description": "Command Optimizer: per-prompt slash and shell command suggestions for Claude Code.",
+  "owner": {
+    "name": "acus9345"
+  },
+  "plugins": [
+    {
+      "name": "command-optimizer",
+      "displayName": "Command Optimizer",
+      "description": "After you press Enter, Sonnet checks your prompt and offers to run a helpful command before Claude starts.",
+      "version": "2.1.0",
+      "source": "./"
+    }
+  ]
+}

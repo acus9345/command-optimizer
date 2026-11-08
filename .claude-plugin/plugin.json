@@ -1,0 +1,41 @@
+{
+  "name": "command-optimizer",
+  "displayName": "Command Optimizer",
+  "version": "2.1.0",
+  "description": "After you press Enter, Sonnet checks your prompt and offers to run a helpful command (/plan, /effort high, /clear, !npm test) before Claude starts.",
+  "author": {
+    "name": "acus9345"
+  },
+  "repository": "https://github.com/acus9345/command-optimizer",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "mod",
+    "commands",
+    "prompt-optimizer",
+    "slash-commands"
+  ],
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Model",
+      "description": "Model that checks each prompt (haiku is cheapest, sonnet is the default)",
+      "default": "sonnet",
+      "options": [
+        "sonnet",
+        "haiku",
+        "opus"
+      ]
+    },
+    "defaultMode": {
+      "type": "string",
+      "title": "Default mode",
+      "description": "ask: after Enter, offer to run a command before Claude starts; band: show suggestions above the prompt without waiting",
+      "default": "ask",
+      "options": [
+        "ask",
+        "band"
+      ]
+    }
+  }
+}
