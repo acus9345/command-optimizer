@@ -9,17 +9,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-function readStdinJson() {
+async function readStdinJson() {
   try {
-    const raw = fs.readFileSync(0, 'utf8').trim();
+    const chunks = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(chunk);
+    }
+    const raw = Buffer.concat(chunks).toString('utf8').trim();
     return raw ? JSON.parse(raw) : {};
   } catch {
     return {};
   }
 }
 
-const input = readStdinJson();
-const userPrompt = (input.prompt || '').trim();
+const input = await readStdinJson();
+const userPrompt = String(input.prompt || '').trim();
 const sessionId = String(input.session_id || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
 
 // Skip empty prompts, slash commands, direct shell escapes, or internal recursive invocations
@@ -39,18 +43,25 @@ const stateFile = path.join(os.tmpdir(), `claude-cmd-optimizer-${sessionId}.json
 let state = { recentPrompts: [], cache: {} };
 try {
   if (fs.existsSync(stateFile)) {
-    state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const parsedState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (parsedState && typeof parsedState === 'object') {
+      state = {
+        recentPrompts: Array.isArray(parsedState.recentPrompts) ? parsedState.recentPrompts : [],
+        cache: parsedState.cache && typeof parsedState.cache === 'object' ? parsedState.cache : {}
+      };
+    }
   }
 } catch {
   state = { recentPrompts: [], cache: {} };
 }
 
+const recentSlice = state.recentPrompts.slice(-2);
 const promptHash = crypto
   .createHash('sha1')
-  .update(JSON.stringify({ recent: state.recentPrompts.slice(-2), prompt: userPrompt }))
+  .update(JSON.stringify({ recent: recentSlice, prompt: userPrompt }))
   .digest('hex');
 
-if (state.cache && state.cache[promptHash]) {
+if (state.cache[promptHash]) {
   process.stdout.write(JSON.stringify(state.cache[promptHash]) + '\n');
   process.exit(0);
 }
@@ -111,15 +122,27 @@ if (process.env.ANTHROPIC_API_KEY) {
 
 // Path B: Fallback to `claude -p --model sonnet` CLI
 if (!rawReply) {
-  const proc = spawnSync(
-    'claude',
-    ['-p', '--model', 'sonnet', '--max-turns', '1', `${SYSTEM_PROMPT}\n\n${userMessage}`],
-    {
-      encoding: 'utf8',
-      timeout: 14000,
-      env: { ...process.env, CMD_OPTIMIZER_INTERNAL: '1' }
-    }
-  );
+  const cliArgs = [
+    '-p',
+    '--model',
+    process.env.CMD_OPTIMIZER_MODEL || 'sonnet',
+    '--max-turns',
+    '1'
+  ];
+  const spawnOpts = {
+    input: `${SYSTEM_PROMPT}\n\n${userMessage}`,
+    encoding: 'utf8',
+    timeout: 14000,
+    env: { ...process.env, CMD_OPTIMIZER_INTERNAL: '1' }
+  };
+  let proc = spawnSync('claude', cliArgs, spawnOpts);
+  if (
+    process.platform === 'win32' &&
+    proc.error &&
+    (proc.error.code === 'ENOENT' || proc.error.code === 'EINVAL')
+  ) {
+    proc = spawnSync('claude', cliArgs, { ...spawnOpts, shell: true });
+  }
   if (proc.status === 0 && proc.stdout) {
     rawReply = proc.stdout.trim();
   }
@@ -134,16 +157,24 @@ try {
   const sIdx = rawReply.indexOf('{');
   const eIdx = rawReply.lastIndexOf('}');
   const parsed = JSON.parse(sIdx !== -1 && eIdx > sIdx ? rawReply.slice(sIdx, eIdx + 1) : rawReply);
-  if (Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
-    formattedLine =
-      '⚡ Sonnet Command Suggestions: ' +
-      parsed.suggestions
-        .slice(0, 3)
-        .map((s, i) => `[${i + 1}] ${s.command} (${s.reason})`)
-        .join(' · ');
+  if (parsed && Array.isArray(parsed.suggestions)) {
+    const valid = parsed.suggestions
+      .filter((s) => s && typeof s.command === 'string' && s.command.trim())
+      .slice(0, 3);
+    if (valid.length > 0) {
+      formattedLine =
+        '⚡ Sonnet Command Suggestions: ' +
+        valid
+          .map((s, i) => {
+            const cmd = s.command.trim();
+            const reason = typeof s.reason === 'string' ? s.reason.trim() : '';
+            return reason ? `[${i + 1}] ${cmd} (${reason})` : `[${i + 1}] ${cmd}`;
+          })
+          .join(' · ');
+    }
   }
 } catch {
-  formattedLine = rawReply.split('\n')[0].slice(0, 240);
+  formattedLine = '';
 }
 
 if (!formattedLine) {

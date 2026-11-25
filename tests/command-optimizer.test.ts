@@ -37,7 +37,14 @@ type Engine = {
 function stubEngine(
   on: any,
   answer: (options: string[]) => string | undefined = () => undefined,
-  extra: { commands?: any[]; reply?: object; switches?: object } = {}
+  extra: {
+    commands?: any[]
+    reply?: object
+    switches?: object
+    onModelComplete?: () => any
+    onToast?: (message: string) => void
+    onCommandRun?: (e: any) => any
+  } = {}
 ) {
   const got: Engine = { model: 0, asked: [], ran: [], sent: [], filled: [], entered: [] }
   mock.store(on)
@@ -45,16 +52,23 @@ function stubEngine(
   on('command.list', () => ({
     value: [{ name: 'deploy', description: 'Deploy service to staging', source: 'plugin' }, ...(extra.commands ?? [])]
   }))
-  on('env.get', ($: any, e: any) => ({ value: e.name === 'USERPROFILE' ? 'C:\Users\me' : undefined }))
+  on('env.get', ($: any, e: any) => ({ value: e.name === 'USERPROFILE' ? 'C:\\Users\\me' : undefined }))
   on('fs.exists', ($: any, e: any) => ({ value: Boolean(extra.switches) && String(e.path).endsWith('switches.json') }))
   on('fs.read', () => ({ value: JSON.stringify(extra.switches ?? {}) }))
   on('command.register', () => ({ value: { command: 'command-optimizer' } }))
   on('session.messages', () => ({ value: [] }))
   on('ui.log', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', ($: any, e: any) => {
+    extra.onToast?.(e.text ?? e.message ?? '')
+    return { value: undefined }
+  })
   on('ui.status', () => ({ value: undefined }))
   on('classic.SessionStart', () => ({}))
-  on('ui.render', () => ({ type: 'Text', props: {}, children: [''] }))
+  on('ui.render', ($: any, e: any) => ({
+    type: 'Text',
+    props: {},
+    children: [e.component === 'Spinner' ? String(e.props?.suffix || '') : '']
+  }))
   on('prompt.fill', ($: any, e: any) => {
     got.filled.push(e.text)
     return { isFilled: true, text: e.text, cursor: e.text.length }
@@ -66,6 +80,7 @@ function stubEngine(
   })
   on('command.run', ($: any, e: any) => {
     got.ran.push('/' + e.command + (e.args ? ' ' + e.args : ''))
+    if (extra.onCommandRun) return extra.onCommandRun(e)
     return { text: 'ok' }
   })
   on('tool.call', { tool: 'AskUserQuestion' }, ($: any, e: any) => {
@@ -78,6 +93,7 @@ function stubEngine(
   })
   on('model.complete', () => {
     got.model += 1
+    if (extra.onModelComplete) return extra.onModelComplete()
     return {
       value: {
         isAnswered: true,
@@ -223,4 +239,178 @@ test('the /mods switchboard turns it off', async ($, on) => {
   await $.prompt.submit({ text: PROMPT, origin: composer } as any)
   expect(got.model).toBe(0)
   expect(got.entered.map((p) => p.text)).toEqual([PROMPT])
+})
+
+const SPINNER = {
+  plugin: 'command-optimizer',
+  component: 'Spinner',
+  requestId: 'spinner',
+  viewport: { columns: 120, rows: 36 },
+  props: { message: 'Working', suffix: '' }
+} as const
+
+test('cache hit while an earlier check is in flight clears checking spinner', async ($, on) => {
+  let resolveSlow!: (v: any) => void
+  let slowStarted!: () => void
+  const slowEntered = new Promise<void>((r) => { slowStarted = r })
+  let call = 0
+  stubEngine(on, undefined, {
+    onModelComplete: () => {
+      call += 1
+      if (call === 1 || call === 3) {
+        return {
+          value: {
+            isAnswered: true,
+            text: JSON.stringify(REPLY),
+            usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+          }
+        }
+      }
+      if (call === 2) {
+        return {
+          value: { isAnswered: false, reason: 'timeout', text: '' }
+        }
+      }
+      slowStarted()
+      return new Promise((resolve) => {
+        resolveSlow = resolve
+      })
+    }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.command.run({ command: 'command-optimizer', args: 'band' })
+
+  const p0 = 'Inspect current project dependencies and scripts'
+  const slowPrompt = 'Add detailed audit logging across all handlers'
+
+  // 1) Cache p0 under []
+  await $.prompt.submit({ text: p0, origin: composer } as any)
+  // 2) Record slowPrompt under [p0] without caching it (isAnswered: false)
+  await $.prompt.submit({ text: slowPrompt, origin: composer } as any)
+  // 3) Cache PROMPT under [p0, slowPrompt]
+  await $.prompt.submit({ text: PROMPT, origin: composer } as any)
+
+  // Reset trajectory while preserving suggestionCache
+  await $.classic.SessionStart({ source: 'clear' } as any)
+  // Replay p0 (cached) so recentPrompts is [p0]
+  await $.prompt.submit({ text: p0, origin: composer } as any)
+
+  // Start slow uncached request for slowPrompt under [p0] (recentPrompts becomes [p0, slowPrompt])
+  const pending = $.prompt.submit({ text: slowPrompt, origin: composer } as any)
+  await slowEntered
+
+  const spinnerWhileBusy = await $.ui.mount({ ...SPINNER, surface: 'terminal' })
+  expect((await spinnerWhileBusy.find({ type: 'Text' }))?.text).toContain('Sonnet checking commands')
+  await spinnerWhileBusy.unmount()
+
+  // While slowPrompt is still in flight, submit PROMPT (hits cache for [p0, slowPrompt] + PROMPT)
+  const cachedSubmit = $.prompt.submit({ text: PROMPT, origin: composer } as any)
+  const settled = await Promise.race([
+    cachedSubmit.then(() => 'settled'),
+    new Promise((r) => setTimeout(() => r('queued'), 50))
+  ])
+
+  if (settled === 'settled') {
+    const spinnerDuring = await $.ui.mount({ ...SPINNER, surface: 'terminal' })
+    expect((await spinnerDuring.find({ type: 'Text' }))?.text ?? '').not.toContain('Sonnet checking commands')
+    await spinnerDuring.unmount()
+  }
+
+  resolveSlow({
+    value: {
+      isAnswered: true,
+      text: JSON.stringify({ suggestions: [] }),
+      usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    }
+  })
+  await pending
+  await cachedSubmit
+
+  const spinnerAfter = await $.ui.mount({ ...SPINNER, surface: 'terminal' })
+  expect((await spinnerAfter.find({ type: 'Text' }))?.text ?? '').not.toContain('Sonnet checking commands')
+  await spinnerAfter.unmount()
+})
+
+test('stale in-flight check does not repopulate band after /clear', async ($, on) => {
+  let resolveModel!: (v: any) => void
+  let modelStarted!: () => void
+  const modelEntered = new Promise<void>((r) => { modelStarted = r })
+  stubEngine(on, undefined, {
+    onModelComplete: () => {
+      modelStarted()
+      return new Promise((resolve) => { resolveModel = resolve })
+    }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.command.run({ command: 'command-optimizer', args: 'band' })
+
+  const pending = $.prompt.submit({ text: PROMPT, origin: composer } as any)
+  await modelEntered
+  await $.classic.SessionStart({ source: 'clear' } as any)
+
+  resolveModel({
+    value: {
+      isAnswered: true,
+      text: JSON.stringify(REPLY),
+      usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    }
+  })
+  await pending
+
+  const ui = await $.ui.mount({ ...ABOVE_PROMPT, surface: 'terminal' })
+  expect(await ui.find({ key: 'cmd-opt-btn-0' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('/command-optimizer 1 dismisses the AbovePrompt band and clears stale attachment suggestions', async ($, on) => {
+  let replyPayload: any = REPLY
+  const got = stubEngine(on, undefined, {
+    onModelComplete: () => ({
+      value: {
+        isAnswered: true,
+        text: JSON.stringify(replyPayload),
+        usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+      }
+    })
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+
+  // In ask mode, prompt with attachment shows suggestions in AbovePrompt
+  await $.prompt.submit({ text: PROMPT, origin: composer, attachments: [{ type: 'file' }] } as any)
+  let ui = await $.ui.mount({ ...ABOVE_PROMPT, surface: 'terminal' })
+  expect(await ui.find({ key: 'cmd-opt-btn-0' })).toBeDefined()
+  await ui.unmount()
+
+  // Selecting suggestion #1 via command fills it and dismisses the band
+  const res = await $.command.run({ command: 'command-optimizer', args: '1' })
+  expect(res.text).toContain('Prepared `/plan`')
+  expect(got.filled).toEqual(['/plan'])
+  ui = await $.ui.mount({ ...ABOVE_PROMPT, surface: 'terminal' })
+  expect(await ui.find({ key: 'cmd-opt-btn-0' })).toBeUndefined()
+  await ui.unmount()
+
+  // Next attachment prompt returning empty clears suggestions
+  await $.prompt.submit({ text: PROMPT, origin: composer, attachments: [{ type: 'file' }] } as any)
+  replyPayload = { suggestions: [] }
+  await $.prompt.submit({ text: 'Check formatting in readme file please', origin: composer, attachments: [{ type: 'file' }] } as any)
+  ui = await $.ui.mount({ ...ABOVE_PROMPT, surface: 'terminal' })
+  expect(await ui.find({ key: 'cmd-opt-btn-0' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('runThenSend reports failure toast when command.run throws with Effort Optimizer', async ($, on) => {
+  const clock = mock.clock(on)
+  const toasts: string[] = []
+  stubEngine(on, (options) => options[0], {
+    commands: EFFORT_MOD,
+    onToast: (message) => toasts.push(message),
+    onCommandRun: () => {
+      throw new Error('command failed')
+    }
+  })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await $.prompt.submit({ text: PROMPT, origin: composer } as any)
+  await clock.advance(1)
+  expect(toasts.some((t) => t.startsWith('Could not run /plan. Your prompt is back in the box'))).toBe(true)
+  expect(toasts.some((t) => t.startsWith('Ran /plan.'))).toBe(false)
 })

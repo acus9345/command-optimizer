@@ -141,6 +141,28 @@ async function readSwitch($) {
 // In-memory LRU of results for identical prompt + history within the session
 const suggestionCache = new Map()
 
+function resetState() {
+  enabled = true
+  mode = 'ask'
+  model = 'sonnet'
+  suggestions = []
+  sessionCommands = []
+  knownCommands = new Set(BUILTIN_COMMANDS.map((c) => c.name))
+  recentPrompts = []
+  checking = false
+  dismissed = false
+  totalChecks = 0
+  memoHits = 0
+  promptCacheReads = 0
+  lastCacheReadTokens = 0
+  checkSeq = 0
+  partners = []
+  skipOnce = ''
+  switchedOff = false
+  switchesPath = ''
+  suggestionCache.clear()
+}
+
 function normalizeName(name) {
   return String(name || '').replace(/^\//, '').trim()
 }
@@ -165,7 +187,8 @@ function buildCatalogText(dynamicCommands) {
 
 // A slash suggestion must name a command this session has; a cli one must start with `!`.
 function isKnownCommand(cmd) {
-  if (cmd.startsWith('!')) return cmd.length > 1
+  if (/[\r\n]/.test(cmd)) return false
+  if (cmd.startsWith('!')) return cmd.slice(1).trim().length > 0
   if (!cmd.startsWith('/')) return false
   const name = cmd.slice(1).split(/\s+/)[0]
   return name !== NAME && !ownedByPartner(name) && knownCommands.has(name)
@@ -292,9 +315,14 @@ async function evaluatePrompt($, promptText) {
     const cached = suggestionCache.get(cacheKey)
     remember(cacheKey, cached) // refresh LRU position
     memoHits += 1
+    const wasChecking = checking
+    checking = false
+    setStatus($, undefined)
     if (mode === 'band') {
       suggestions = cached
       dismissed = false
+      $.ui.invalidate('ui.render')
+    } else if (wasChecking) {
       $.ui.invalidate('ui.render')
     }
     return cached
@@ -380,9 +408,11 @@ function runThenSend($, command, promptText) {
   const args = parts.slice(1).join(' ')
   const checkers = promptCheckingPartners()
   $.clock.after(0, async () => {
+    let ranOk = true
     try {
       await $.command.run(args ? { command: name, args } : { command: name })
     } catch (err) {
+      ranOk = false
       $.ui.toast('Could not run `' + command + '`: ' + String((err && err.message) || err).slice(0, 120))
     }
     if (checkers.length > 0) {
@@ -390,7 +420,11 @@ function runThenSend($, command, promptText) {
       try {
         const res = await $.prompt.fill({ text: promptText })
         if (res && res.isFilled) {
-          $.ui.toast('Ran ' + command + '. Your prompt is back in the box: press Enter to send it')
+          $.ui.toast(
+            (ranOk ? 'Ran ' : 'Could not run ') +
+              command +
+              '. Your prompt is back in the box: press Enter to send it'
+          )
           return
         }
       } catch {
@@ -428,7 +462,7 @@ async function askBeforeSending($, e, next, current) {
 
   if (picked.kind === 'cli') {
     // Claude runs the shell command first, through the normal permission prompt
-    const shell = picked.command.slice(1)
+    const shell = picked.command.slice(1).trim()
     $.ui.toast('Claude will run `' + shell + '` first')
     return next({
       ...e,
@@ -466,7 +500,9 @@ function statusText() {
 }
 
 export function register(on, options) {
-  if (options && MODELS.includes(options.model)) model = options.model
+  resetState()
+  const optModel = options && String(options.model || '').trim().toLowerCase()
+  if (MODELS.includes(optModel)) model = optModel
   if (options && asMode(options.defaultMode)) mode = asMode(options.defaultMode)
 
   // 1. Session start: load saved settings, discover commands, register /command-optimizer
@@ -474,7 +510,9 @@ export function register(on, options) {
     await loadSavedConfig($)
     try {
       const home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
-      switchesPath = home ? home.split('\\').join('/') + '/.claude/mods/switches.json' : ''
+      switchesPath = home
+        ? home.split('\\').join('/').replace(/\/+$/, '') + '/.claude/mods/switches.json'
+        : ''
       await readSwitch($)
     } catch {
       switchesPath = ''
@@ -491,9 +529,15 @@ export function register(on, options) {
           ...BUILTIN_COMMANDS.map((c) => c.name),
           ...sessionCommands.map((c) => normalizeName(c.name)).filter(Boolean)
         ])
+      } else {
+        sessionCommands = []
+        partners = []
+        knownCommands = new Set(BUILTIN_COMMANDS.map((c) => c.name))
       }
     } catch {
       sessionCommands = []
+      partners = []
+      knownCommands = new Set(BUILTIN_COMMANDS.map((c) => c.name))
     }
     try {
       await $.command.register({
@@ -510,10 +554,13 @@ export function register(on, options) {
 
   // 2. Clear stale turn state after /clear, /resume, or a fork
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
+    checkSeq += 1
     recentPrompts = []
     suggestions = []
     checking = false
     dismissed = false
+    skipOnce = ''
+    setStatus($, undefined)
     await loadSavedConfig($)
     $.ui.invalidate('ui.render')
     return next(e)
@@ -527,12 +574,17 @@ export function register(on, options) {
       const chosen = suggestions[Number(arg) - 1]
       if (!chosen) return { text: 'No suggestion #' + arg + ' is active.' }
       await applyCommandChoice($, chosen.command)
+      dismissed = true
+      $.ui.invalidate('ui.render')
       return { text: 'Prepared `' + chosen.command + '`: ' + chosen.reason }
     }
 
     if (arg === 'off' || arg === 'disable') {
+      checkSeq += 1
       enabled = false
       checking = false
+      suggestions = []
+      setStatus($, undefined)
       await $.store.set('enabled', false)
       $.ui.invalidate('ui.render')
       return { text: 'Command Optimizer is off. Run `/command-optimizer on` to turn it back on.' }
@@ -546,9 +598,12 @@ export function register(on, options) {
     }
 
     if (asMode(arg)) {
+      checkSeq += 1
       mode = asMode(arg)
       enabled = true
+      checking = false
       suggestions = []
+      setStatus($, undefined)
       await $.store.set('mode', mode)
       await $.store.set('enabled', true)
       $.ui.invalidate('ui.render')
@@ -561,13 +616,14 @@ export function register(on, options) {
       }
     }
 
+    await readSwitch($)
     return { text: statusText() }
   })
 
   // 4. After Enter: check the prompt
   on('prompt.submit', async ($, e, next) => {
     // The prompt this mod handed back after running a command: send it, unchecked this time
-    if (skipOnce && (e.text || '').trim() === skipOnce) {
+    if (skipOnce && (!e.origin || PERSON_ORIGINS.has(e.origin.kind)) && (e.text || '').trim() === skipOnce) {
       skipOnce = ''
       return next(e)
     }
@@ -582,15 +638,21 @@ export function register(on, options) {
     // Prompts with attachments can't be held and sent again, so they take this path too.
     if (mode === 'band' || (e.attachments && e.attachments.length > 0)) {
       const checkTask = evaluatePrompt($, promptText).catch(() => [])
+      const runSeq = checkSeq
       recordPrompt()
       const turnResult = await next(e)
       const found = await checkTask
-      if (mode !== 'band' && found.length > 0) {
+      if (mode !== 'band' && runSeq === checkSeq) {
         suggestions = found
         dismissed = false
         $.ui.invalidate('ui.render')
       }
       return turnResult
+    }
+
+    if (suggestions.length > 0) {
+      suggestions = []
+      $.ui.invalidate('ui.render')
     }
 
     // ask: Sonnet checks before Claude starts
@@ -606,17 +668,17 @@ export function register(on, options) {
 
   // 5. Annotate the spinner while a band-mode check runs
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
-    if (!enabled || !checking) return next(e)
+    if (!enabled || switchedOff || !checking) return next(e)
     return next({
       ...e,
-      props: { ...e.props, suffix: (e.props.suffix || '') + ' · Sonnet checking commands…' }
+      props: { ...e.props, suffix: ((e.props && e.props.suffix) || '') + ' · Sonnet checking commands…' }
     })
   })
 
   // 6. Band mode: suggestions above the prompt
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const downstream = await next(e)
-    if (!enabled || switchedOff || dismissed || suggestions.length === 0 || e.props.hasSurvey) {
+    if (!enabled || switchedOff || dismissed || suggestions.length === 0 || (e.props && e.props.hasSurvey)) {
       return downstream
     }
 
